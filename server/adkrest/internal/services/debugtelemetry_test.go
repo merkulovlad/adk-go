@@ -31,6 +31,7 @@ import (
 
 func TestDebugTelemetryGetSpansBySessionID(t *testing.T) {
 	ctx := context.Background()
+	baseTime := time.Unix(0, 0)
 
 	type testCase struct {
 		name             string
@@ -45,10 +46,10 @@ func TestDebugTelemetryGetSpansBySessionID(t *testing.T) {
 			testSetup: func(rootCtx context.Context, tracer trace.Tracer, logger log.Logger) {
 				rootCtx, rootSpan := tracer.Start(rootCtx, "root-span", trace.WithAttributes(
 					attribute.String(string(semconv.GenAIConversationIDKey), "session-1"),
-				))
+				), trace.WithTimestamp(baseTime))
 				defer rootSpan.End()
 
-				childCtx, childSpan := tracer.Start(rootCtx, "child-span")
+				childCtx, childSpan := tracer.Start(rootCtx, "child-span", trace.WithTimestamp(baseTime.Add(time.Millisecond)))
 				childLog := log.Record{}
 				childLog.SetBody(log.StringValue("child-log-body"))
 				childLog.SetEventName("child-log-event")
@@ -94,12 +95,12 @@ func TestDebugTelemetryGetSpansBySessionID(t *testing.T) {
 			name: "child span with conversation id",
 			testSetup: func(rootCtx context.Context, tracer trace.Tracer, logger log.Logger) {
 				var rootSpan trace.Span
-				rootCtx, rootSpan = tracer.Start(rootCtx, "root")
-				childCtx, childSpan := tracer.Start(rootCtx, "child")
-				_, secondChildSpan := tracer.Start(rootCtx, "child-2")
+				rootCtx, rootSpan = tracer.Start(rootCtx, "root", trace.WithTimestamp(baseTime))
+				childCtx, childSpan := tracer.Start(rootCtx, "child", trace.WithTimestamp(baseTime.Add(time.Millisecond)))
+				_, secondChildSpan := tracer.Start(rootCtx, "child-2", trace.WithTimestamp(baseTime.Add(2*time.Millisecond)))
 				_, thirdChildSpan := tracer.Start(childCtx, "grandchild", trace.WithAttributes(
 					semconv.GenAIConversationID("test-session-id"),
-				))
+				), trace.WithTimestamp(baseTime.Add(3*time.Millisecond)))
 				thirdChildSpan.End()
 				secondChildSpan.End()
 				childSpan.End()
@@ -125,17 +126,17 @@ func TestDebugTelemetryGetSpansBySessionID(t *testing.T) {
 				// Trace 1
 				root1Ctx, root1Span := tracer.Start(ctx, "root-1", trace.WithAttributes(
 					semconv.GenAIConversationID("session-1"),
-				))
-				_, child1 := tracer.Start(root1Ctx, "child-1")
+				), trace.WithTimestamp(baseTime))
+				_, child1 := tracer.Start(root1Ctx, "child-1", trace.WithTimestamp(baseTime.Add(time.Millisecond)))
 				child1.End()
 				root1Span.End()
 
 				// Trace 2 (different trace ID, same session ID)
 				// Session ID on child span
-				root2Ctx, root2Span := tracer.Start(ctx, "root-2")
+				root2Ctx, root2Span := tracer.Start(ctx, "root-2", trace.WithTimestamp(baseTime.Add(2*time.Millisecond)))
 				_, child2 := tracer.Start(root2Ctx, "child-2", trace.WithAttributes(
 					semconv.GenAIConversationID("session-1"),
-				))
+				), trace.WithTimestamp(baseTime.Add(3*time.Millisecond)))
 				child2.End()
 				root2Span.End()
 			},
@@ -152,10 +153,10 @@ func TestDebugTelemetryGetSpansBySessionID(t *testing.T) {
 			testSetup: func(ctx context.Context, tracer trace.Tracer, logger log.Logger) {
 				rootCtx, rootSpan := tracer.Start(ctx, "mixed-root", trace.WithAttributes(
 					semconv.GenAIConversationID("session-1"),
-				))
+				), trace.WithTimestamp(baseTime))
 				_, childSpan := tracer.Start(rootCtx, "mixed-child", trace.WithAttributes(
 					semconv.GenAIConversationID("session-2"),
-				))
+				), trace.WithTimestamp(baseTime.Add(time.Millisecond)))
 				childSpan.End()
 				rootSpan.End()
 			},
@@ -170,10 +171,10 @@ func TestDebugTelemetryGetSpansBySessionID(t *testing.T) {
 			testSetup: func(ctx context.Context, tracer trace.Tracer, logger log.Logger) {
 				rootCtx, rootSpan := tracer.Start(ctx, "mixed-root", trace.WithAttributes(
 					semconv.GenAIConversationID("session-1"),
-				))
+				), trace.WithTimestamp(baseTime))
 				_, childSpan := tracer.Start(rootCtx, "mixed-child", trace.WithAttributes(
 					semconv.GenAIConversationID("session-2"),
-				))
+				), trace.WithTimestamp(baseTime.Add(time.Millisecond)))
 				childSpan.End()
 				rootSpan.End()
 			},
@@ -242,6 +243,7 @@ func TestDebugTelemetryGetSpansBySessionID(t *testing.T) {
 
 func TestDebugTelemetryGetSpansByEventID(t *testing.T) {
 	ctx := context.Background()
+	baseTime := time.Unix(0, 0)
 
 	type testCase struct {
 		name           string
@@ -291,13 +293,13 @@ func TestDebugTelemetryGetSpansByEventID(t *testing.T) {
 				span1Ctx, span1 := tracer.Start(span1Ctx, "root-1", trace.WithAttributes(
 					attribute.String("gcp.vertex.agent.event_id", "event-1"),
 					attribute.String("genai.operation.name", "generate_content"),
-				))
+				), trace.WithTimestamp(baseTime))
 				defer span1.End()
 
 				_, span2 := tracer.Start(span1Ctx, "root-2", trace.WithAttributes(
 					attribute.String("gcp.vertex.agent.event_id", "event-1"),
 					attribute.String("genai.operation.name", "execute_tool"),
-				))
+				), trace.WithTimestamp(baseTime.Add(time.Millisecond)))
 				defer span2.End()
 			},
 			queryEventID: "event-1",
