@@ -1209,6 +1209,147 @@ func TestRemoteAgent_ErrorEventOnServerError(t *testing.T) {
 	}
 }
 
+func TestRemoteAgent_CancelsRemoteTaskWhenContextCanceledBeforeFirstEvent(t *testing.T) {
+	remoteTaskCreated := make(chan a2a.TaskID, 1)
+	releaseFirstEvent := make(chan struct{}, 1)
+	remoteTaskCancelled := make(chan a2a.TaskID, 1)
+	remoteContextCancelled := make(chan struct{}, 1)
+
+	executor := &mockA2AExecutor{
+		cancelFn: func(ctx context.Context, reqCtx *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
+			return func(yield func(a2a.Event, error) bool) {
+				remoteTaskCancelled <- reqCtx.TaskID
+				yield(a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateCanceled, nil), nil)
+			}
+		},
+		executeFn: func(ctx context.Context, reqCtx *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
+			return func(yield func(a2a.Event, error) bool) {
+				remoteTaskCreated <- reqCtx.TaskID
+				<-releaseFirstEvent
+				yield(a2a.NewSubmittedTask(reqCtx, reqCtx.Message), nil)
+			}
+		},
+	}
+	serverB := startA2AServer(executor)
+	t.Cleanup(func() {
+		select {
+		case releaseFirstEvent <- struct{}{}:
+		default:
+		}
+		serverB.Close()
+	})
+
+	card := &a2a.AgentCard{
+		SupportedInterfaces: []*a2a.AgentInterface{
+			a2a.NewAgentInterface(serverB.URL, a2a.TransportProtocolJSONRPC),
+		},
+		Capabilities: a2a.AgentCapabilities{Streaming: true},
+	}
+	remoteAgent := utils.Must(NewA2A(A2AConfig{
+		Name:      "a2a agent",
+		AgentCard: card,
+		BeforeAgentCallbacks: []agent.BeforeAgentCallback{
+			func(ctx agent.CallbackContext) (*genai.Content, error) {
+				go func() {
+					<-ctx.Done()
+					remoteContextCancelled <- struct{}{}
+				}()
+				return nil, nil
+			},
+		},
+	}))
+	rootAgent := newRootAgent("root", remoteAgent)
+	executorA := adka2a.NewExecutor(adka2a.ExecutorConfig{
+		RunnerConfig: runner.Config{
+			AppName:        rootAgent.Name(),
+			Agent:          rootAgent,
+			SessionService: session.InMemoryService(),
+		},
+		RunConfig: agent.RunConfig{
+			StreamingMode: agent.StreamingModeSSE,
+		},
+	})
+
+	serverA := startA2AServer(executorA)
+	t.Cleanup(serverA.Close)
+
+	clientA := newA2AClient(t, serverA)
+	message := a2a.NewMessage(
+		a2a.MessageRoleUser,
+		a2a.NewTextPart("hello"),
+	)
+
+	parentTaskCreated := make(chan a2a.TaskID, 1)
+	streamErr := make(chan error, 1)
+	go func() {
+		for event, err := range clientA.SendStreamingMessage(t.Context(), &a2a.SendMessageRequest{Message: message}) {
+			if err != nil {
+				streamErr <- err
+				return
+			}
+			taskID := event.TaskInfo().TaskID
+			if taskID == "" {
+				streamErr <- fmt.Errorf("event %T has empty task ID", event)
+				return
+			}
+			select {
+			case parentTaskCreated <- taskID:
+			default:
+			}
+		}
+	}()
+
+	var remoteTaskID a2a.TaskID
+	select {
+	case remoteTaskID = <-remoteTaskCreated:
+	case err := <-streamErr:
+		t.Fatalf("clientA.SendStreamingMessage() error = %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for remote task to be created")
+	}
+
+	var parentTaskID a2a.TaskID
+	select {
+	case parentTaskID = <-parentTaskCreated:
+	case err := <-streamErr:
+		t.Fatalf("clientA.SendStreamingMessage() error = %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for parent task to be created")
+	}
+
+	parentCancelErr := make(chan error, 1)
+	go func() {
+		_, err := clientA.CancelTask(t.Context(), &a2a.CancelTaskRequest{ID: parentTaskID})
+		parentCancelErr <- err
+	}()
+
+	select {
+	case <-remoteContextCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for remote agent context cancellation")
+	}
+
+	releaseFirstEvent <- struct{}{}
+
+	select {
+	case cancelledTaskID := <-remoteTaskCancelled:
+		if cancelledTaskID != remoteTaskID {
+			t.Fatalf("cancelled remote task ID = %q, want %q", cancelledTaskID, remoteTaskID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for remote task to be cancelled on remote side")
+	}
+
+	select {
+	case err := <-parentCancelErr:
+		if err != nil {
+			t.Fatalf("clientA.CancelTask() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for parent task cancellation")
+	}
+}
+
 func TestRemoteAgent_CustomConverters(t *testing.T) {
 	originalA2APart := a2a.NewTextPart("hello")
 	customA2APart := a2a.NewTextPart("modified")
